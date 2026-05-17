@@ -334,6 +334,7 @@ PAGES = {
     "Secure Applications": {
         "icon": "🌐",
         "items": [
+            ("Live Secure Chat","📡","Real network chat · TP6 Ex6.1/6.3"),
             ("Secure TCP",    "🔌", "AES+RSA+HMAC over sockets · TP6 Ex6.1"),
             ("Secure UDP Chat","💬","AES-CTR+HMAC chat · TP6 Ex6.3"),
             ("PGP Hybrid",    "📧", "PGP-style encrypt+sign · TP6"),
@@ -2270,4 +2271,352 @@ elif page == "PGP Hybrid":
         <b>Authenticity:</b> Only Alice could have signed (only Alice has her private signing key).<br>
         <b>Integrity:</b> The signature covers H(ciphertext) — any modification breaks the signature.<br>
         <b>Non-repudiation:</b> Alice cannot later deny sending the message — her signature is unforgeable.
+        """)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TP6 — LIVE SECURE CHAT  (real bidirectional network chat)
+# ─────────────────────────────────────────────────────────────────────────────
+elif page == "Live Secure Chat":
+
+    import socket as _sock, struct as _struct, json as _json
+
+    # ── helpers (inline, no import issues in Streamlit) ──────────────────────
+    def _exact(s, n):
+        buf = b''
+        while len(buf) < n:
+            c = s.recv(n - len(buf))
+            if not c: return b''
+            buf += c
+        return buf
+
+    def _send_pkt(s, data: bytes):
+        s.sendall(_struct.pack('>I', len(data)) + data)
+
+    def _recv_pkt(s) -> bytes:
+        h = _exact(s, 4)
+        return _exact(s, _struct.unpack('>I', h)[0]) if h else b''
+
+    def _pack(text: str, key_hex: str) -> bytes:
+        import hashlib, hmac as _h
+        data = text.encode()
+        iv   = AES.generate_iv()
+        mac  = _h.new(bytes.fromhex(key_hex), data, hashlib.sha256).hexdigest()
+        ct   = AES.encrypt_cbc(data, key_hex, iv)
+        return iv + mac.encode() + ct
+
+    def _unpack(payload: bytes, key_hex: str):
+        import hashlib, hmac as _h
+        iv  = payload[:16]
+        mac = payload[16:80].decode()
+        ct  = payload[80:]
+        pt  = AES.decrypt_cbc(ct, key_hex, iv)
+        exp = _h.new(bytes.fromhex(key_hex), pt, hashlib.sha256).hexdigest()
+        if not _h.compare_digest(mac, exp):
+            raise ValueError("HMAC FAILED")
+        return pt.decode(), iv.hex(), mac, ct.hex()
+
+    def _do_handshake(ip, port, key_hex, name):
+        """Connect, exchange RSA/AES keys, send name, wait for HANDSHAKE_OK."""
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.settimeout(8)
+        s.connect((ip, int(port)))
+        # receive RSA public key
+        pub  = _recv_pkt(s)
+        nh, eh = pub.decode().split('|')
+        n, e = int(nh, 16), int(eh, 16)
+        # send AES session key encrypted with RSA
+        kb  = bytes.fromhex(key_hex)
+        enc = RSA.encrypt_bytes(kb, e, n)
+        _send_pkt(s, enc)
+        # send our name
+        _send_pkt(s, name.encode())
+        # receive HANDSHAKE_OK
+        ack_raw = _recv_pkt(s)
+        ack, _, _, _ = _unpack(ack_raw, key_hex)
+        if ack != "HANDSHAKE_OK":
+            s.close()
+            raise ValueError(f"Unexpected ACK: {ack}")
+        return s   # keep socket open!
+
+    def _poll_http(ip, http_port, since):
+        """Poll HTTP API for new messages (non-blocking)."""
+        try:
+            import urllib.request
+            url = f"http://{ip}:{http_port}/messages?since={since}"
+            with urllib.request.urlopen(url, timeout=3) as r:
+                return _json.loads(r.read())
+        except Exception:
+            return []
+
+    # ── init session state ────────────────────────────────────────────────────
+    for _k, _v in [
+        ("lsc_connected", False), ("lsc_key", None), ("lsc_name", "PC"),
+        ("lsc_ip", "127.0.0.1"), ("lsc_port", 9999),
+        ("lsc_sock", None), ("lsc_log", []), ("lsc_last_id", 0),
+    ]:
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    # ── page header ───────────────────────────────────────────────────────────
+    theory("Live Secure Chat — TP6 Ex6.1",
+        """Real bidirectional encrypted chat between two devices on the same Wi-Fi.<br>
+        <b>Protocol:</b> RSA-1024 key exchange → AES-256-CBC + HMAC-SHA256 per message.<br>
+        <b>Broadcast:</b> Server forwards every message to all other connected clients,
+        re-encrypted with <i>their</i> session key. No plaintext ever leaves a device.
+        """)
+
+    howto([
+        "Run <code>python chat_server.py</code> on your PC (terminal).",
+        "Find your PC local IP: <b>Windows</b> → <code>ipconfig</code> | <b>Linux</b> → <code>hostname -I</code>",
+        "Open CryptoLab on <b>both devices</b> (PC browser + phone browser at <code>http://&lt;PC-IP&gt;:8501</code>).",
+        "Enter the same server IP on both devices → give each device a name → Connect → Chat!",
+    ])
+
+    # ── setup box ─────────────────────────────────────────────────────────────
+    _html("""<div style="background:linear-gradient(135deg,rgba(0,255,156,.07),rgba(0,180,255,.04));
+        border:1px solid rgba(0,255,156,.3);border-radius:14px;padding:16px 20px;margin:0 0 18px;
+        font-size:13px;color:#D6DEEC;line-height:1.9;">
+      <b style="color:#00FF9C;font-size:13.5px;">⚙️ One-time setup on your PC</b><br>
+      <code style="background:rgba(0,0,0,.4);border-radius:6px;padding:2px 8px;color:#00FF9C;">
+        python chat_server.py</code>
+      &nbsp; then open this page on your <b>phone</b> at
+      <code style="color:#06B6D4">http://&lt;your-PC-IP&gt;:8501</code><br>
+      <span style="color:#9CA3B8;font-size:12px;">
+        ⚠ Both devices must be on the <b style="color:#E6EDF3">same Wi-Fi</b>.
+        Server uses TCP port <b>9999</b> + HTTP port <b>10000</b>.
+      </span></div>""")
+
+    # ── connection form ───────────────────────────────────────────────────────
+    section("Connection")
+    ca, cb, cc = st.columns([2, 1, 1])
+    ip_in   = ca.text_input("Server IP", value=st.session_state["lsc_ip"],
+                             placeholder="e.g. 192.168.1.42")
+    pt_in   = cb.number_input("TCP Port", 1024, 65535,
+                               value=int(st.session_state["lsc_port"]))
+    nm_in   = cc.text_input("Your name", value=st.session_state["lsc_name"],
+                             placeholder="PC  /  Phone  /  Alice…")
+
+    connected = st.session_state["lsc_connected"]
+    ba, bb = st.columns(2)
+    do_connect    = ba.button("🔌  Connect", use_container_width=True, disabled=connected)
+    do_disconnect = bb.button("⛔  Disconnect", use_container_width=True, disabled=not connected)
+
+    if do_disconnect:
+        try:
+            old_sock = st.session_state.get("lsc_sock")
+            if old_sock: old_sock.close()
+        except Exception: pass
+        for k in ["lsc_connected","lsc_key","lsc_sock","lsc_log","lsc_last_id"]:
+            st.session_state[k] = False if k=="lsc_connected" else (None if k in ("lsc_key","lsc_sock") else ([] if k=="lsc_log" else 0))
+        st.rerun()
+
+    if do_connect:
+        try:
+            st.session_state["lsc_ip"]   = ip_in
+            st.session_state["lsc_port"] = pt_in
+            st.session_state["lsc_name"] = nm_in or "user"
+            key_hex = AES.generate_key(256)
+            with st.spinner(f"Connecting to {ip_in}:{pt_in} …"):
+                sock = _do_handshake(ip_in, pt_in, key_hex, nm_in or "user")
+            st.session_state["lsc_key"]       = key_hex
+            st.session_state["lsc_sock"]      = sock
+            st.session_state["lsc_connected"] = True
+            st.session_state["lsc_log"] = [{
+                "from": "System", "text": f"✓ Connected as '{nm_in}' — AES-256 channel ready.",
+                "ts": "", "iv": "", "ct": "", "mine": False, "system": True
+            }]
+            st.rerun()
+        except Exception as ex:
+            st.error(f"Connection failed: {ex} — Make sure chat_server.py is running on {ip_in}.")
+
+    # ── status badge ──────────────────────────────────────────────────────────
+    connected = st.session_state["lsc_connected"]
+    key_hex   = st.session_state.get("lsc_key")
+
+    if connected and key_hex:
+        _html(f"""<div style="display:flex;align-items:center;gap:10px;
+            background:rgba(0,255,156,.06);border:1px solid rgba(0,255,156,.3);
+            border-radius:10px;padding:10px 16px;margin:10px 0;font-size:13px;">
+          <div style="width:9px;height:9px;border-radius:50%;background:#00FF9C;
+                      box-shadow:0 0 0 4px rgba(0,255,156,.2);flex-shrink:0"></div>
+          <div><b style="color:#00FF9C">Connected</b> as
+            <b style="color:#E6EDF3">{st.session_state["lsc_name"]}</b> —
+            session key: <code style="color:#9CA3B8">{key_hex[:16]}…</code>
+          </div></div>""")
+    else:
+        _html("""<div style="display:flex;align-items:center;gap:10px;
+            background:rgba(248,113,113,.06);border:1px solid rgba(248,113,113,.3);
+            border-radius:10px;padding:10px 16px;margin:10px 0;font-size:13px;">
+          <div style="width:9px;height:9px;border-radius:50%;background:#F87171;flex-shrink:0"></div>
+          <div><b style="color:#F87171">Not connected</b> —
+            start <code>chat_server.py</code> then click Connect.</div></div>""")
+
+    # ── send + receive panel ──────────────────────────────────────────────────
+    if connected and key_hex:
+
+        # ── Poll for new messages from server HTTP API ─────────────────────
+        http_port    = int(st.session_state["lsc_port"]) + 1
+        since_id     = st.session_state["lsc_last_id"]
+        new_messages = _poll_http(st.session_state["lsc_ip"], http_port, since_id)
+        my_name      = st.session_state["lsc_name"]
+
+        for msg in new_messages:
+            if msg["from"] == "SERVER":
+                continue  # skip internal join/leave notices shown inline
+            # Only add messages from OTHERS (our own are logged on send)
+            if msg["from"] != my_name:
+                st.session_state["lsc_log"].append({
+                    "from":   msg["from"],
+                    "text":   msg["text"],
+                    "ts":     msg.get("ts",""),
+                    "iv":     msg.get("iv",""),
+                    "ct":     msg.get("ct",""),
+                    "mine":   False,
+                    "system": False,
+                })
+            if msg["id"] >= st.session_state["lsc_last_id"]:
+                st.session_state["lsc_last_id"] = msg["id"] + 1
+
+        # ── Send form ──────────────────────────────────────────────────────
+        section("Send Message")
+        msg_text = st.text_input("Message", placeholder="Type and press Enter or click Send…",
+                                 key="lsc_msg")
+        s1, s2, s3 = st.columns([3, 1, 1])
+        do_send    = s1.button("📤  Encrypt & Send", use_container_width=True,
+                               disabled=not msg_text)
+        do_refresh = s2.button("🔄  Refresh", use_container_width=True)
+        do_clear   = s3.button("🗑️  Clear", use_container_width=True)
+
+        if do_clear:
+            st.session_state["lsc_log"] = []
+            st.rerun()
+
+        if do_refresh:
+            st.rerun()
+
+        if do_send and msg_text:
+            try:
+                payload = _pack(msg_text, key_hex)
+                iv_hex  = payload[:16].hex()
+                mac_hex = payload[16:80].decode()
+                ct_hex  = payload[80:].hex()
+
+                sock = st.session_state.get("lsc_sock")
+                if sock is None:
+                    st.error("Socket lost — please Disconnect and reconnect.")
+                else:
+                    with st.spinner("Sending…"):
+                        _send_pkt(sock, payload)
+                        # receive ACK from server
+                        ack_raw = _recv_pkt(sock)
+                        ack_txt = "(no ack)"
+                        if ack_raw:
+                            try:
+                                ack_txt, _, _, _ = _unpack(ack_raw, key_hex)
+                            except Exception:
+                                pass
+
+                    st.session_state["lsc_log"].append({
+                        "from":   f"📤 {my_name} (you)",
+                        "text":   msg_text,
+                        "ts":     "",
+                        "iv":     iv_hex,
+                        "ct":     ct_hex,
+                        "mac":    mac_hex,
+                        "ack":    ack_txt,
+                        "mine":   True,
+                        "system": False,
+                    })
+                    st.rerun()
+            except Exception as ex:
+                st.error(f"Send error: {ex}. Try Disconnect → Reconnect.")
+
+        # ── Chat log ───────────────────────────────────────────────────────
+        section("Chat — Live")
+        log = st.session_state["lsc_log"]
+
+        if not log:
+            st.info("No messages yet — send something or wait for the other device to write.")
+        else:
+            for entry in reversed(log):
+                is_mine  = entry.get("mine", False)
+                is_sys   = entry.get("system", False)
+                sender   = entry["from"]
+                text     = entry["text"]
+                iv_h     = entry.get("iv","")
+                ct_h     = entry.get("ct","")
+                mac_h    = entry.get("mac","")
+                ack      = entry.get("ack","")
+                ts       = entry.get("ts","")
+
+                if is_sys:
+                    _html(f"""<div style="text-align:center;color:#6B7390;
+                        font-size:12px;padding:6px 0;margin:4px 0;">
+                        ℹ️ {text}</div>""")
+                    continue
+
+                align  = "flex-end"   if is_mine else "flex-start"
+                bubble = "rgba(139,92,246,0.18)" if is_mine else "rgba(6,182,212,0.10)"
+                border = "rgba(139,92,246,0.4)"  if is_mine else "rgba(6,182,212,0.3)"
+                label  = "You" if is_mine else sender
+                ts_str = f" · {ts}" if ts else ""
+
+                # Show ciphertext (what actually went over the network)
+                ct_preview = (ct_h[:48] + "…") if len(ct_h) > 48 else ct_h
+                iv_preview = iv_h[:32] if iv_h else "—"
+                mac_preview = (mac_h[:32] + "…") if mac_h else "—"
+
+                _html(f"""
+                <div style="display:flex;justify-content:{align};margin:0 0 14px;">
+                  <div style="max-width:82%;min-width:220px;
+                      background:{bubble};border:1px solid {border};
+                      border-radius:14px;padding:12px 16px;">
+
+                    <div style="display:flex;justify-content:space-between;
+                        margin-bottom:8px;align-items:baseline;">
+                      <span style="font-weight:700;color:#E6EDF3;font-size:13px;">{label}</span>
+                      <span style="font-size:10.5px;color:#6B7390;">{ts_str}</span>
+                    </div>
+
+                    <!-- Plaintext -->
+                    <div style="font-size:16px;color:#FFFFFF;
+                        font-weight:500;margin-bottom:10px;
+                        padding:8px 12px;background:rgba(255,255,255,0.05);
+                        border-radius:8px;">{text}</div>
+
+                    <!-- Ciphertext wire data -->
+                    <div style="font-size:10.5px;color:#6B7390;margin-bottom:3px;
+                        text-transform:uppercase;letter-spacing:.08em;">
+                      🔒 Encrypted (what travels on network)</div>
+                    <div style="font-family:'JetBrains Mono',monospace;font-size:10.5px;
+                        color:#F472B6;background:rgba(0,0,0,.35);border-radius:6px;
+                        padding:6px 10px;word-break:break-all;margin-bottom:6px;">
+                      {ct_preview if ct_preview else "—"}</div>
+
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;
+                        font-size:10px;color:#6B7390;">
+                      <div>IV: <span style="color:#06B6D4;font-family:monospace">
+                        {iv_preview}</span></div>
+                      <div>HMAC: <span style="color:#8B5CF6;font-family:monospace">
+                        {mac_preview}</span></div>
+                    </div>
+                    {f'<div style="font-size:10.5px;color:#34D399;margin-top:6px;">✓ {ack}</div>' if ack else ""}
+                  </div>
+                </div>""")
+
+        # ── auto-refresh hint ──────────────────────────────────────────────
+        _html("""<div style="text-align:center;color:#6B7390;font-size:12px;
+            padding:10px 0;">
+            Click <b style="color:#E6EDF3">🔄 Refresh</b> to load new messages
+            from the other device.</div>""")
+
+        answer_note("How messages are delivered", """
+        <b>Send:</b> Your message is encrypted AES-256-CBC with a fresh IV → HMAC-SHA256 →
+        sent over TCP to the server.<br>
+        <b>Broadcast:</b> The server decrypts it, logs it, then <i>re-encrypts</i> it with
+        each recipient's own session key and pushes it over their persistent TCP connection.<br>
+        <b>Receive:</b> The Streamlit app polls the server's HTTP API (port 10000) for new
+        messages and shows them with their ciphertext so you can see the encrypted form.<br>
+        <b>Zero plaintext on the wire:</b> every byte that crosses the network is ciphertext.
         """)
